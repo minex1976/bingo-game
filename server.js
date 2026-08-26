@@ -6,7 +6,27 @@ const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+
+// ===== CONFIGURE SOCKET.IO FOR RENDER =====
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  },
+  // Force polling first, then upgrade to WebSocket
+  transports: ['polling', 'websocket'],
+  // Increase timeout for slow connections
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  // Allow upgrades
+  allowUpgrades: true,
+  // Cookie settings for sticky sessions
+  cookie: {
+    name: "io",
+    httpOnly: true,
+    sameSite: "lax"
+  }
+});
 
 app.use(express.static('public'));
 
@@ -65,7 +85,6 @@ setInterval(() => {
 
 function getRoom(roomName) { return rooms[roomName]; }
 
-// ===== CLEAN TIMER FUNCTION =====
 function stopTimer(room) {
   if (room.timerInterval) {
     clearInterval(room.timerInterval);
@@ -74,16 +93,13 @@ function stopTimer(room) {
   room.isCountingDown = false;
 }
 
-// ===== START TIMER (ONLY WITH 2+ PLAYERS) =====
 function startTimer(roomName) {
   const room = getRoom(roomName);
   if (!room) return;
   if (room.gameState !== 'selection') return;
   
-  // Stop any existing timer first
   stopTimer(room);
   
-  // Check if we have at least 2 players with picks
   const playersWithPick = Object.values(room.players).filter(
     p => p.pick !== null && p.round === room.round
   );
@@ -95,7 +111,6 @@ function startTimer(roomName) {
     return;
   }
   
-  // Start the timer
   room.timer = 30;
   room.isCountingDown = true;
   io.to(roomName).emit('timerUpdate', room.timer);
@@ -106,18 +121,13 @@ function startTimer(roomName) {
     io.to(roomName).emit('timerUpdate', room.timer);
     
     if (room.timer <= 0) {
-      // Stop the timer
       stopTimer(room);
-      
-      // Check again if we have enough players
       const playersWithPickNow = Object.values(room.players).filter(
         p => p.pick !== null && p.round === room.round
       );
-      
       if (playersWithPickNow.length >= 2) {
         executeSpin(roomName);
       } else {
-        // Not enough players – reset timer
         room.timer = 30;
         room.isCountingDown = false;
         io.to(roomName).emit('timerUpdate', room.timer);
@@ -127,12 +137,10 @@ function startTimer(roomName) {
   }, 1000);
 }
 
-// ===== SPIN LOGIC =====
 function executeSpin(roomName) {
   const room = getRoom(roomName);
   if (!room) return;
   
-  // Make sure timer is stopped
   stopTimer(room);
   
   if (room.gameState === 'spinning') return;
@@ -189,7 +197,6 @@ function executeSpin(roomName) {
     });
   }
   
-  // Auto-restart after 5 seconds
   setTimeout(() => {
     Object.keys(room.players).forEach(name => {
       room.players[name].pick = null;
@@ -209,7 +216,6 @@ function executeSpin(roomName) {
     io.to(roomName).emit('playersUpdate', room.players);
     io.to(roomName).emit('timerUpdate', room.timer);
     
-    // Check if we have 2+ players before starting timer again
     const playersWithPickAfterReset = Object.values(room.players).filter(
       p => p.pick !== null && p.round === room.round
     );
@@ -224,6 +230,9 @@ function executeSpin(roomName) {
 // ===== SOCKET.IO EVENTS =====
 io.on('connection', (socket) => {
   console.log('👤 Player connected:', socket.id);
+  
+  // Send connection confirmation
+  socket.emit('connected', { status: 'ok', socketId: socket.id });
   
   socket.on('login', ({ username, password }) => {
     if (users[username] && users[username].password === password) {
@@ -283,7 +292,6 @@ io.on('connection', (socket) => {
     socket.emit('roomState', roomData);
     io.to(room).emit('playersUpdate', roomData.players);
     
-    // Only start timer if 2+ players and not already counting
     if (roomData.gameState === 'selection' && !roomData.isCountingDown && !roomData.timerInterval) {
       const playerCount = Object.keys(roomData.players).length;
       if (playerCount >= 2) {
@@ -317,7 +325,6 @@ io.on('connection', (socket) => {
     player.ready = number !== null;
     io.to(room).emit('playersUpdate', roomData.players);
     
-    // After a player picks, check if we should start the timer
     if (roomData.gameState === 'selection' && !roomData.isCountingDown && !roomData.timerInterval) {
       const playersWithPick = Object.values(roomData.players).filter(
         p => p.pick !== null && p.round === roomData.round
@@ -394,7 +401,6 @@ io.on('connection', (socket) => {
         delete room.players[socket.username];
         io.to(socket.currentRoom).emit('playersUpdate', room.players);
         
-        // If less than 2 players, stop the timer
         const playerCount = Object.keys(room.players).length;
         if (playerCount < 2 && room.isCountingDown) {
           stopTimer(room);
@@ -458,4 +464,5 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`🚀 Bingo server running on http://localhost:${PORT}`);
   console.log(`📊 Admin panel at http://localhost:${PORT}/admin.html`);
+  console.log(`🔌 Socket.IO configured with polling + WebSocket fallback`);
 });
