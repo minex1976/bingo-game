@@ -38,7 +38,8 @@ let rooms = readData('rooms.json') || {
     cumulativeRotation: 0, 
     potAmount: 0, 
     totalBets: 0,
-    timerInterval: null
+    timerInterval: null,
+    isCountingDown: false
   },
   room_20: { 
     players: {}, 
@@ -51,7 +52,8 @@ let rooms = readData('rooms.json') || {
     cumulativeRotation: 0, 
     potAmount: 0, 
     totalBets: 0,
-    timerInterval: null
+    timerInterval: null,
+    isCountingDown: false
   }
 };
 
@@ -63,65 +65,94 @@ setInterval(() => {
 
 function getRoom(roomName) { return rooms[roomName]; }
 
-// ===== SERVER-AUTHORITATIVE TIMER =====
+// ===== CLEAN TIMER FUNCTION =====
+function stopTimer(room) {
+  if (room.timerInterval) {
+    clearInterval(room.timerInterval);
+    room.timerInterval = null;
+  }
+  room.isCountingDown = false;
+}
+
+// ===== START TIMER (ONLY WITH 2+ PLAYERS) =====
 function startTimer(roomName) {
   const room = getRoom(roomName);
   if (!room) return;
   if (room.gameState !== 'selection') return;
   
-  // Clear existing timer
-  if (room.timerInterval) {
-    clearInterval(room.timerInterval);
-    room.timerInterval = null;
+  // Stop any existing timer first
+  stopTimer(room);
+  
+  // Check if we have at least 2 players with picks
+  const playersWithPick = Object.values(room.players).filter(
+    p => p.pick !== null && p.round === room.round
+  );
+  
+  if (playersWithPick.length < 2) {
+    room.timer = 30;
+    io.to(roomName).emit('timerUpdate', room.timer);
+    io.to(roomName).emit('statusUpdate', '⏳ Waiting for more players...');
+    return;
   }
   
-  // Reset to 30 seconds
+  // Start the timer
   room.timer = 30;
+  room.isCountingDown = true;
   io.to(roomName).emit('timerUpdate', room.timer);
+  io.to(roomName).emit('statusUpdate', '⏳ Timer started!');
   
   room.timerInterval = setInterval(() => {
     room.timer--;
     io.to(roomName).emit('timerUpdate', room.timer);
     
     if (room.timer <= 0) {
-      clearInterval(room.timerInterval);
-      room.timerInterval = null;
+      // Stop the timer
+      stopTimer(room);
       
-      // Check if enough players
-      const playersWithPick = Object.values(room.players).filter(
+      // Check again if we have enough players
+      const playersWithPickNow = Object.values(room.players).filter(
         p => p.pick !== null && p.round === room.round
       );
       
-      if (playersWithPick.length >= 2) {
+      if (playersWithPickNow.length >= 2) {
         executeSpin(roomName);
       } else {
         // Not enough players – reset timer
         room.timer = 30;
+        room.isCountingDown = false;
         io.to(roomName).emit('timerUpdate', room.timer);
-        startTimer(roomName);
+        io.to(roomName).emit('statusUpdate', '⏳ Waiting for more players...');
       }
     }
   }, 1000);
 }
 
+// ===== SPIN LOGIC =====
 function executeSpin(roomName) {
   const room = getRoom(roomName);
-  if (!room || room.gameState === 'spinning') return;
+  if (!room) return;
+  
+  // Make sure timer is stopped
+  stopTimer(room);
+  
+  if (room.gameState === 'spinning') return;
+  
+  const playersWithPick = Object.values(room.players).filter(
+    p => p.pick !== null && p.round === room.round
+  );
+  
+  if (playersWithPick.length < 2) {
+    room.gameState = 'selection';
+    room.timer = 30;
+    io.to(roomName).emit('gameStateUpdate', { gameState: 'selection' });
+    io.to(roomName).emit('timerUpdate', room.timer);
+    return;
+  }
   
   room.gameState = 'spinning';
   io.to(roomName).emit('gameStateUpdate', { gameState: 'spinning' });
   
-  const takenNumbers = Object.values(room.players)
-    .filter(p => p.pick !== null && p.round === room.round)
-    .map(p => p.pick);
-  
-  if (takenNumbers.length < 2) {
-    room.gameState = 'selection';
-    io.to(roomName).emit('gameStateUpdate', { gameState: 'selection' });
-    startTimer(roomName);
-    return;
-  }
-  
+  const takenNumbers = playersWithPick.map(p => p.pick);
   const winningNumber = takenNumbers[Math.floor(Math.random() * takenNumbers.length)];
   const betAmount = Object.values(room.players)[0]?.bet || 10;
   const totalPot = takenNumbers.length * betAmount;
@@ -145,7 +176,6 @@ function executeSpin(roomName) {
     pot: totalPot 
   });
   
-  // Distribute winnings
   if (winners.length > 0) {
     const winAmount = Math.floor(prizePool / winners.length);
     winners.forEach(username => {
@@ -173,11 +203,21 @@ function executeSpin(roomName) {
     room.gameState = 'selection';
     room.timer = 30;
     room.potAmount = 0;
+    room.isCountingDown = false;
     
     io.to(roomName).emit('gameStateUpdate', { gameState: 'selection', round: room.round });
     io.to(roomName).emit('playersUpdate', room.players);
     io.to(roomName).emit('timerUpdate', room.timer);
-    startTimer(roomName);
+    
+    // Check if we have 2+ players before starting timer again
+    const playersWithPickAfterReset = Object.values(room.players).filter(
+      p => p.pick !== null && p.round === room.round
+    );
+    if (playersWithPickAfterReset.length >= 2) {
+      startTimer(roomName);
+    } else {
+      io.to(roomName).emit('statusUpdate', '⏳ Waiting for players...');
+    }
   }, 5000);
 }
 
@@ -185,7 +225,6 @@ function executeSpin(roomName) {
 io.on('connection', (socket) => {
   console.log('👤 Player connected:', socket.id);
   
-  // Login
   socket.on('login', ({ username, password }) => {
     if (users[username] && users[username].password === password) {
       socket.username = username;
@@ -199,7 +238,6 @@ io.on('connection', (socket) => {
     }
   });
   
-  // Signup
   socket.on('signup', ({ username, password }) => {
     if (users[username]) {
       socket.emit('loginError', 'Username already exists');
@@ -216,7 +254,6 @@ io.on('connection', (socket) => {
     socket.emit('loginSuccess', { username, mainWallet: 0, playWallet: 10 });
   });
   
-  // Join room
   socket.on('joinRoom', ({ room, bet }) => {
     if (!socket.username) return;
     const roomData = getRoom(room);
@@ -246,13 +283,19 @@ io.on('connection', (socket) => {
     socket.emit('roomState', roomData);
     io.to(room).emit('playersUpdate', roomData.players);
     
-    // Start timer if not already running
-    if (roomData.gameState === 'selection' && !roomData.timerInterval) {
-      startTimer(room);
+    // Only start timer if 2+ players and not already counting
+    if (roomData.gameState === 'selection' && !roomData.isCountingDown && !roomData.timerInterval) {
+      const playerCount = Object.keys(roomData.players).length;
+      if (playerCount >= 2) {
+        startTimer(room);
+      } else {
+        roomData.timer = 30;
+        io.to(room).emit('timerUpdate', roomData.timer);
+        io.to(room).emit('statusUpdate', '⏳ Waiting for more players...');
+      }
     }
   });
   
-  // Pick number
   socket.on('pickNumber', ({ room, number }) => {
     if (!socket.username) return;
     const roomData = getRoom(room);
@@ -273,9 +316,18 @@ io.on('connection', (socket) => {
     player.round = roomData.round;
     player.ready = number !== null;
     io.to(room).emit('playersUpdate', roomData.players);
+    
+    // After a player picks, check if we should start the timer
+    if (roomData.gameState === 'selection' && !roomData.isCountingDown && !roomData.timerInterval) {
+      const playersWithPick = Object.values(roomData.players).filter(
+        p => p.pick !== null && p.round === roomData.round
+      );
+      if (playersWithPick.length >= 2) {
+        startTimer(room);
+      }
+    }
   });
   
-  // Transfer to play
   socket.on('transferToPlay', ({ amount }) => {
     if (!socket.username) return;
     const user = users[socket.username];
@@ -293,7 +345,6 @@ io.on('connection', (socket) => {
     });
   });
   
-  // Withdraw request
   socket.on('withdrawRequest', ({ amount }) => {
     if (!socket.username) return;
     const user = users[socket.username];
@@ -321,7 +372,6 @@ io.on('connection', (socket) => {
     });
   });
   
-  // Deposit request
   socket.on('depositRequest', ({ amount }) => {
     if (!socket.username) return;
     const tx = {
@@ -336,7 +386,6 @@ io.on('connection', (socket) => {
     socket.emit('transactionPending', { id: tx.id });
   });
   
-  // Disconnect
   socket.on('disconnect', () => {
     console.log('❌ Player disconnected:', socket.id);
     if (socket.username && socket.currentRoom) {
@@ -344,6 +393,15 @@ io.on('connection', (socket) => {
       if (room && room.players[socket.username]) {
         delete room.players[socket.username];
         io.to(socket.currentRoom).emit('playersUpdate', room.players);
+        
+        // If less than 2 players, stop the timer
+        const playerCount = Object.keys(room.players).length;
+        if (playerCount < 2 && room.isCountingDown) {
+          stopTimer(room);
+          room.timer = 30;
+          io.to(socket.currentRoom).emit('timerUpdate', room.timer);
+          io.to(socket.currentRoom).emit('statusUpdate', '⏳ Waiting for more players...');
+        }
       }
     }
   });
