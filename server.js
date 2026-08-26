@@ -1,3 +1,8 @@
+// Add this after the socket.io configuration
+console.log('🚀 Server starting...');
+console.log(`📁 Data directory: ${DATA_DIR}`);
+console.log(`👥 Users loaded: ${Object.keys(users).length}`);
+console.log(`📊 Transactions loaded: ${transactions.length}`);
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
